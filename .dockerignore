@@ -1,0 +1,13 @@
+# advisor.db is rebuilt inside the image from vendored data/ — never copy a host build in
+advisor.db
+*.db-wal
+*.db-shm
+
+.git
+.gitignore
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+README.md

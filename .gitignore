@@ -1,0 +1,16 @@
+# generated artifacts
+advisor.db
+cve.db
+cve.db.*.tmp
+*.db-wal
+*.db-shm
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# os
+.DS_Store

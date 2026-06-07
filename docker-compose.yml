@@ -1,0 +1,157 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-advisor}
+      POSTGRES_DB: advisor
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # internal only; never published to the host (advisor reaches it over the network)
+    expose: ["5432"]
+    # Postgres is the CPU/IO sink under load (HNSW vector probe + cve_affected seeks
+    # over ~3.4M rows). Defaults (shared_buffers=128MB) lean entirely on the OS page
+    # cache; here we give PG real memory so the HNSW index + hot pages stay in its own
+    # buffers. Sized for this box (~31GB RAM); knobs are env-overridable for smaller VPSs.
+    # NOTE: shared_buffers needs a restart to take effect (a compose recreate does this).
+    shm_size: ${PG_SHM_SIZE:-2gb}     # parallel workers use /dev/shm (DSM). The HNSW reindex still
+                                      # runs SINGLE-THREADED in sync_cve_pg.py — even 2gb is < the
+                                      # ~2.14gb a parallel HNSW build wants — so this is just headroom
+                                      # for parallel queries; the reindex no longer depends on it.
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=${PG_SHARED_BUFFERS:-8GB}"          # PG's own page cache (~25% RAM)
+      - "-c"
+      - "effective_cache_size=${PG_EFFECTIVE_CACHE:-24GB}"  # planner hint: OS+PG cache (~75% RAM)
+      - "-c"
+      - "maintenance_work_mem=${PG_MAINT_WORK_MEM:-2GB}"    # speeds the nightly HNSW REINDEX/VACUUM
+      - "-c"
+      - "work_mem=${PG_WORK_MEM:-64MB}"                     # per sort/hash node (× connections — keep modest)
+      - "-c"
+      - "random_page_cost=1.1"                              # SSD: random ≈ sequential
+      - "-c"
+      - "effective_io_concurrency=200"                      # SSD: deep IO queue
+      - "-c"
+      - "max_parallel_workers_per_gather=4"                 # let lexical/seq scans fan out
+      - "-c"
+      - "max_parallel_workers=8"
+      - "-c"
+      - "max_wal_size=4GB"                                  # fewer checkpoints during the COPY-heavy sync
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "jit=off"                                           # queries are short; JIT compile overhead hurts here
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d advisor"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # one-shot: download the published IaC catalog (catalog-latest) + load it, then exit.
+  # advisor waits on this so it can serve search_rules immediately. Uses sync_iac.py
+  # (not load_iac.py) so no catalog needs to be vendored in the image.
+  init:
+    image: bumper-advisor:local   # built once by the `advisor` service; reused here
+    restart: "no"
+    command: python scripts/sync_iac.py
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-advisor}@postgres/advisor
+      CATALOG_URL: ${CATALOG_URL:-https://github.com/gnana997/bumper/releases/download/catalog-latest/catalog.tar.gz}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # The ONE service that builds the shared image; init/cve-sync/scheduler reuse the tag.
+  # (Multiple `build:` services exporting the same tag races the compose bake builder.)
+  advisor:
+    build: .
+    image: bumper-advisor:local
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-advisor}@postgres/advisor
+      WORKERS: ${WORKERS:-2}
+      # MCP host allowlist (DNS-rebinding guard). localhost works out of the box; set
+      # this to your public hostname(s) when exposing, e.g. advisor.example.com.
+      ADVISOR_ALLOWED_HOSTS: ${ADVISOR_ALLOWED_HOSTS:-localhost,127.0.0.1}
+      # Only needed if a BROWSER app calls /mcp (comma-separated, exact-match origins).
+      ADVISOR_ALLOWED_ORIGINS: ${ADVISOR_ALLOWED_ORIGINS:-}
+      # rate limiting (applied ONLY to /scan) — shared Redis store across workers
+      RATELIMIT_REDIS: redis://redis:6379/0
+      SCAN_RATE_LIMIT: ${SCAN_RATE_LIMIT:-40/minute}
+    # loopback only: reachable from host tools, never the public internet
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # CVE mirror: ONE-SHOT initial full sync on boot (then exits). The daily re-sync is
+  # driven by the scheduler (supercronic), not a sleep-loop. Runs independently of the
+  # advisor — until the
+  # first sync commits, lookup_cve returns status=unavailable (never a false "clean").
+  # The freshness guard (CVE_MIN_SYNC_AGE_HOURS) makes a reboot skip if still fresh.
+  # Set CVE_ECOSYSTEMS to limit the set (e.g. for testing).
+  cve-sync:
+    image: bumper-advisor:local
+    restart: "no"
+    command: python scripts/sync_cve_pg.py
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-advisor}@postgres/advisor
+      CVE_ECOSYSTEMS: ${CVE_ECOSYSTEMS:-}
+      CVE_MIN_SYNC_AGE_HOURS: ${CVE_MIN_SYNC_AGE_HOURS:-20}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+
+  # Daily scheduler: container-native cron (supercronic) running the sync jobs IN this
+  # container on a fixed UTC schedule (see scripts/crontab). Deliberately NO Docker
+  # socket — a security product must not expose the host's Docker API. Runs as the
+  # unprivileged image user; supercronic passes this service's env to each job.
+  scheduler:
+    image: bumper-advisor:local
+    restart: unless-stopped
+    command: supercronic -passthrough-logs /app/scripts/crontab
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-advisor}@postgres/advisor
+      CVE_ECOSYSTEMS: ${CVE_ECOSYSTEMS:-}
+      CVE_MIN_SYNC_AGE_HOURS: ${CVE_MIN_SYNC_AGE_HOURS:-20}
+      CATALOG_URL: ${CATALOG_URL:-https://github.com/gnana997/bumper/releases/download/catalog-latest/catalog.tar.gz}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+
+  # Expose it yourself: the `advisor` port is bound to loopback (127.0.0.1:8000).
+  # Put your own reverse proxy / TLS (or a tunnel) in front. See docs/self-hosting.md.
+
+  # Rate-limit store for /scan (shared across uvicorn workers). Counters only —
+  # ephemeral: no persistence (a restart just resets the windows) and tiny memory
+  # (keys auto-expire). Internal network only; never published.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    expose: ["6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata: {}

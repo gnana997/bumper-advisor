@@ -1,0 +1,26 @@
+[project]
+name = "bumper-advisor"
+version = "0.1.0"
+description = "Hosted, knowledge-only semantic search over bumper's enforced rules + the federated IaC advisory catalog. MCP (streamable-http) + REST."
+requires-python = ">=3.12"
+dependencies = [
+  "mcp>=1.9.0",            # FastMCP, streamable-http
+  "model2vec>=0.3.0",     # static embeddings (potion-retrieval-32M), numpy-only, no torch
+  "numpy>=1.26",
+  "uvicorn>=0.30",
+  "starlette>=0.37",      # dual MCP + REST app (pulled in by mcp, pinned explicitly)
+  "psycopg[binary]>=3.2", # Postgres driver
+  "psycopg-pool>=3.2",    # connection pool
+  "pgvector>=0.3",        # python <-> pgvector vector adapter
+  "cvss>=3.0",            # CVSS vector -> base score -> severity tier
+  "univers>=30.11",       # version-range matching across ecosystems (lookup_cve)
+  "limits>=3.13",         # rate limiting (/scan only) — moving-window strategy
+  "redis>=5.0",           # shared rate-limit store across uvicorn workers
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

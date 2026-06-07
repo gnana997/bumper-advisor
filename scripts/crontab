@@ -1,0 +1,10 @@
+# bumper-advisor daily sync — run by the `scheduler` service (supercronic).
+# Times are UTC. supercronic passes the scheduler container's environment to each
+# job (DATABASE_URL, CVE_*, CATALOG_URL) and streams job output to `docker logs`.
+#
+# Standard 5-field cron:  m h dom mon dow  command
+#
+# CVE/OSV mirror refresh (the freshness guard skips if a recent sync already ran):
+0  3 * * *  cd /app && python scripts/sync_cve_pg.py
+# IaC catalog refresh from the published artifact (built by the Go repo CI):
+30 3 * * *  cd /app && python scripts/sync_iac.py
